@@ -152,7 +152,6 @@ class Oauth2TokenAuthHandler(HTTPBasicAuthHandler):
         return process_urllib_response(token_response)['token']
 
     def process_oauth2(self, request, response, www_authenticate_header):
-
         # This keeps infinite auth loops from happening
         full_url = request.full_url
         self.auth_failure_tracker[full_url] += 1
@@ -322,9 +321,21 @@ def get_containers(names, require_present, exclude_containers):
     all_container_names = set(get_ps_name(x['Names']) for x in containers_list)
 
     if exclude_containers:
-        all_container_names = all_container_names.difference(exclude_containers)
+        patterns = exclude_containers
+        to_exclude = set()
+        for pattern in patterns:
+            try:
+                compiled_pattern = re.compile(pattern)
+            except re.error as e:
+                critical(f"Ungültiger Regex-Ausdruck in --exclude_containers: {pattern}. Fehler: {e}")
+                continue
+            matched = {name for name in all_container_names if compiled_pattern.match(name)}
+            if matched:
+                logger.debug(f"Ausschließen von Containern: {matched} basierend auf Muster: {pattern}")
+            to_exclude.update(matched)
+        all_container_names = all_container_names.difference(to_exclude)
 
-    if 'all' in names:
+    if 'all' in names or not names:
         return all_container_names
 
     filtered = set()
@@ -334,7 +345,7 @@ def get_containers(names, require_present, exclude_containers):
             if re.match("^{}$".format(matcher), candidate):
                 filtered.add(candidate)
                 found = True
-        # If we don't find a container that matches out regex
+        # If we don't find a container that matches our regex
         if require_present and not found:
             critical("No containers match {}".format(matcher))
 
@@ -532,14 +543,14 @@ def check_memory(container, thresholds):
         adjusted_usage -= inspection['memory_stats']['stats']['inactive_file']
 
     if thresholds.units == '%':
-        max = 100
+        max_val = 100
         usage = int(100 * adjusted_usage / inspection['memory_stats']['limit'])
     else:
-        max = inspection['memory_stats']['limit'] / unit_adjustments[thresholds.units]
+        max_val = inspection['memory_stats']['limit'] / unit_adjustments[thresholds.units]
         usage = adjusted_usage / unit_adjustments[thresholds.units]
 
     evaluate_numeric_thresholds(container=container, value=usage, thresholds=thresholds, name='memory',
-                                short_name='mem', min=0, max=max)
+                                short_name='mem', min=0, max=max_val)
 
 
 @multithread_execution()
@@ -587,7 +598,7 @@ def check_uptime(container, thresholds):
 
 @multithread_execution()
 def check_image_age(container, thresholds):
-    container_image = get_container_info(container)['Image']
+    container_image = get_container_image_id(container)
     image_created = get_image_info(container_image)['Created']
     only_secs = image_created[0:19]
     start = datetime.strptime(only_secs, "%Y-%m-%dT%H:%M:%S")
@@ -698,10 +709,10 @@ def check_cpu(container, thresholds):
 
     usage = calculate_cpu_capacity_precentage(info=info, stats=stats)
 
-    max = 100
+    max_val = 100
     thresholds.units = '%'
     evaluate_numeric_thresholds(container=container, value=usage, thresholds=thresholds, name='cpu', short_name='cpu',
-                                min=0, max=max)
+                                min=0, max=max_val)
 
 
 def process_args(args):
@@ -746,25 +757,19 @@ def process_args(args):
                         default=DEFAULT_TIMEOUT,
                         help='Connection timeout in seconds. (default: %(default)s)')
 
-    # Container name
+    # Container name (komma-separiert)
     parser.add_argument('--containers',
                         dest='containers',
-                        action='store',
-                        nargs='+',
                         type=str,
-                        default=['all'],
-                        help='One or more RegEx that match the names of the container(s) to check. If omitted all containers are checked. (default: %(default)s)')
+                        help='Eine komma-separierte Liste von Regex-Mustern, um Container auszuwählen. Beispiel: "^app-.*$,^db-.*$"')
 
-    # Exclude container name
+    # Exclude container name (komma-separiert)
     parser.add_argument('--exclude_containers',
                         dest='exclude_containers',
-                        action='store',
-                        nargs='+',
                         type=str,
-                        default=[],
-                        help='One or more containers to ignore. If omitted all containers are checked.')
+                        help='Eine komma-separierte Liste von Regex-Mustern, um Container auszuschließen. Beispiel: "^test-.*$,^dev-.*$"')
 
-    # Container name
+    # Container muss vorhanden sein
     parser.add_argument('--present',
                         dest='present',
                         default=False,
@@ -777,7 +782,7 @@ def process_args(args):
                         default=DEFAULT_PARALLELISM,
                         action='store',
                         type=int,
-                        help='This + 1 is the maximum number of concurent threads/network connections. (default: %(default)s)')
+                        help='This + 1 is the maximum number of concurrent threads/network connections. (default: %(default)s)')
 
     # CPU
     parser.add_argument('--cpu',
@@ -793,7 +798,7 @@ def process_args(args):
                         action='store',
                         type=str,
                         metavar='WARN:CRIT:UNITS',
-                        help='Check memory usage taking into account any limits. Valid values for units are %%,B,KB,MB,GB.')
+                        help='Check memory usage taking into account any limits. Valid values for units are %,B,KB,MB,GB.')
 
     # State
     parser.add_argument('--status',
@@ -832,7 +837,7 @@ def process_args(args):
                         action='store_true',
                         help='Check if the running images are the same version as those in the registry. Useful for finding stale images. Does not support login.')
 
-    # Version
+    # Insecure registries
     parser.add_argument('--insecure-registries',
                         dest='insecure_registries',
                         action='store',
@@ -884,7 +889,11 @@ def process_args(args):
             daemon = 'http://' + parsed_args.connection
             connection_type = 'http'
 
-    return parsed_args
+    # Splitting the comma-separated strings into lists
+    containers = parsed_args.containers.split(',') if parsed_args.containers else ['all']
+    exclude_containers = parsed_args.exclude_containers.split(',') if parsed_args.exclude_containers else []
+
+    return parsed_args, containers, exclude_containers
 
 
 def no_checks_present(parsed_args):
@@ -924,82 +933,107 @@ def print_results():
 
 
 def perform_checks(raw_args):
-    args = process_args(raw_args)
+    parsed_args, containers, exclude_containers = process_args(raw_args)
 
     global parallel_executor
-    parallel_executor = futures.ThreadPoolExecutor(max_workers=args.threads)
+    parallel_executor = futures.ThreadPoolExecutor(max_workers=parsed_args.threads)
     global serial_executor
     serial_executor = futures.ThreadPoolExecutor(max_workers=1)
 
     global unit_adjustments
-    unit_adjustments = {key: args.units_base ** value for key, value in UNIT_ADJUSTMENTS_TEMPLATE.items()}
+    unit_adjustments = {key: parsed_args.units_base ** value for key, value in UNIT_ADJUSTMENTS_TEMPLATE.items()}
 
     global no_ok
-    no_ok = args.no_ok
+    no_ok = parsed_args.no_ok
 
     global no_performance
-    no_performance = args.no_ok
+    no_performance = parsed_args.no_performance
 
-    if socketfile_permissions_failure(args):
-        unknown("Cannot access docker socket file. User ID={}, socket file={}".format(os.getuid(), args.connection))
+    if socketfile_permissions_failure(parsed_args):
+        unknown("Cannot access docker socket file. User ID={}, socket file={}".format(os.getuid(), parsed_args.connection))
         return
 
-    if args.containers == ["all"] and args.present:
+    if parsed_args.containers == "all" and parsed_args.present:
         unknown("You can not use --present without --containers")
         return
 
-    if no_checks_present(args):
+    if no_checks_present(parsed_args):
         unknown("No checks specified.")
         return
 
-    # Here is where all the work happens
+    # This is where all the work happens
     #############################################################################################
     try:
-        containers = get_containers(args.containers, args.present, args.exclude_containers)
+        matching_containers = get_containers(containers, parsed_args.present, exclude_containers)
     except URLError as e:
         critical(f'Failed to connect to daemon: {e.reason}.')
         print_results()
         exit(rc)
 
-    if len(containers) == 0 and not args.present:
+    if len(matching_containers) == 0 and not parsed_args.present:
         unknown("No containers names found matching criteria")
         return
 
-    for container in containers:
+    for container in matching_containers:
 
         # Check status
-        if args.status:
-            check_status(container, args.status)
+        if parsed_args.status:
+            check_status(container, parsed_args.status)
 
         # Check version
-        if args.version:
-            check_version(container, args.insecure_registries)
+        if parsed_args.version:
+            check_version(container, parsed_args.insecure_registries)
 
-        # below are checks that require a 'running' status
+        # Below are checks that require a 'running' status
 
-        # Check status
-        if args.health:
+        # Check health
+        if parsed_args.health:
             check_health(container)
 
         # Check cpu usage
-        if args.cpu:
-            check_cpu(container, parse_thresholds(args.cpu, units_required=False))
+        if parsed_args.cpu:
+            try:
+                thresholds = parse_thresholds(parsed_args.cpu, units_required=False)
+            except ValueError as e:
+                critical(f"Invalid CPU threshold specification for container {container}: {e}")
+                continue
+            check_cpu(container, thresholds)
 
         # Check memory usage
-        if args.memory:
-            check_memory(container, parse_thresholds(args.memory, units_required=False))
+        if parsed_args.memory:
+            try:
+                thresholds = parse_thresholds(parsed_args.memory, units_required=False)
+            except ValueError as e:
+                critical(f"Invalid memory threshold specification for container {container}: {e}")
+                continue
+            check_memory(container, thresholds)
 
         # Check uptime
-        if args.uptime:
-            check_uptime(container, parse_thresholds(args.uptime, include_units=False))
+        if parsed_args.uptime:
+            try:
+                thresholds = parse_thresholds(parsed_args.uptime, include_units=False)
+            except ValueError as e:
+                critical(f"Invalid uptime threshold specification for container {container}: {e}")
+                continue
+            check_uptime(container, thresholds)
 
         # Check image age
-        if args.image_age:
-            check_image_age(container, parse_thresholds(args.image_age, include_units=False))
+        if parsed_args.image_age:
+            try:
+                thresholds = parse_thresholds(parsed_args.image_age, include_units=False)
+            except ValueError as e:
+                critical(f"Invalid image age threshold specification for container {container}: {e}")
+                continue
+            check_image_age(container, thresholds)
 
         # Check restart count
-        if args.restarts:
-            check_restarts(container, parse_thresholds(args.restarts, include_units=False))
+        if parsed_args.restarts:
+            try:
+                thresholds = parse_thresholds(parsed_args.restarts, include_units=False)
+            except ValueError as e:
+                critical(f"Invalid restarts threshold specification for container {container}: {e}")
+                continue
+            check_restarts(container, thresholds)
 
 
 def main():
