@@ -315,25 +315,22 @@ def get_ps_name(name_list):
         raise NameError("Error when trying to identify 'ps' name in {}".format(name_list))
 
 
-def get_containers(names, require_present, exclude_containers):
+def get_containers(names, require_present, exclude_containers=None):
     containers_list, _ = get_url(daemon + '/containers/json?all=1')
-
     all_container_names = set(get_ps_name(x['Names']) for x in containers_list)
 
     if exclude_containers:
-        patterns = exclude_containers
-        to_exclude = set()
-        for pattern in patterns:
+        compiled_patterns = []
+        for pattern in exclude_containers:
             try:
-                compiled_pattern = re.compile(pattern)
+                compiled_patterns.append(re.compile(pattern))
             except re.error as e:
-                critical(f"Ungültiger Regex-Ausdruck in --exclude_containers: {pattern}. Fehler: {e}")
+                critical(f"Unsupported Regex in --exclude_containers: {pattern}. Error: {e}")
                 continue
-            matched = {name for name in all_container_names if compiled_pattern.match(name)}
-            if matched:
-                logger.debug(f"Ausschließen von Containern: {matched} basierend auf Muster: {pattern}")
-            to_exclude.update(matched)
-        all_container_names = all_container_names.difference(to_exclude)
+        to_exclude = {name for name in all_container_names for pat in compiled_patterns if pat.match(name)}
+        if to_exclude:
+            logger.debug(f"Exclude containers: {to_exclude}")
+        all_container_names -= to_exclude
 
     if 'all' in names or not names:
         return all_container_names
@@ -434,7 +431,6 @@ def require_running(name):
 
     return inner_decorator
 
-
 def multithread_execution(disable_threading=DISABLE_THREADING):
     def inner_decorator(func):
         def wrapper(container, *args, **kwargs):
@@ -446,7 +442,6 @@ def multithread_execution(disable_threading=DISABLE_THREADING):
         return wrapper
 
     return inner_decorator
-
 
 def singlethread_execution(disable_threading=DISABLE_THREADING):
     def inner_decorator(func):
@@ -718,22 +713,25 @@ def check_cpu(container, thresholds):
 def process_args(args):
     parser = argparse.ArgumentParser(description='Check docker containers.')
 
+    def split_comma_separated(value):
+        return value.split(',')
+
     # Connect to local socket or ip address
     connection_group = parser.add_mutually_exclusive_group()
     connection_group.add_argument('--connection',
-                                  dest='connection',
-                                  action='store',
-                                  default=DEFAULT_SOCKET,
-                                  type=str,
-                                  metavar='[/<path to>/docker.socket|<ip/host address>:<port>]',
-                                  help='Where to find docker daemon socket. (default: %(default)s)')
+                            dest='connection',
+                            action='store',
+                            default=DEFAULT_SOCKET,
+                            type=str,
+                            metavar='[/<path to>/docker.socket|<ip/host address>:<port>]',
+                            help='Where to find docker daemon socket. (default: %(default)s)')
 
     connection_group.add_argument('--secure-connection',
-                                  dest='secure_connection',
-                                  action='store',
-                                  type=str,
-                                  metavar='[<ip/host address>:<port>]',
-                                  help='Where to find TLS protected docker daemon socket.')
+                            dest='secure_connection',
+                            action='store',
+                            type=str,
+                            metavar='[<ip/host address>:<port>]',
+                            help='Where to find TLS protected docker daemon socket.')
 
     base_group = parser.add_mutually_exclusive_group()
     base_group.add_argument('--binary_units',
@@ -757,19 +755,21 @@ def process_args(args):
                         default=DEFAULT_TIMEOUT,
                         help='Connection timeout in seconds. (default: %(default)s)')
 
-    # Container name (komma-separiert)
+    # Container name
     parser.add_argument('--containers',
                         dest='containers',
-                        type=str,
-                        help='Eine komma-separierte Liste von Regex-Mustern, um Container auszuwählen. Beispiel: "^app-.*$,^db-.*$"')
+                        type=split_comma_separated,
+                        default=['all'],
+                        help='Comma separated list of containers or RegEx: "^app-.*$,^db-.*$"')
 
-    # Exclude container name (komma-separiert)
+    # Exclude container name
     parser.add_argument('--exclude_containers',
                         dest='exclude_containers',
-                        type=str,
-                        help='Eine komma-separierte Liste von Regex-Mustern, um Container auszuschließen. Beispiel: "^test-.*$,^dev-.*$"')
+                        type=split_comma_separated,
+                        default=[],
+                        help='Comma separated list of containers or RegEx: "^test-.*$,^dev-.*$"')
 
-    # Container muss vorhanden sein
+    # Container must be present
     parser.add_argument('--present',
                         dest='present',
                         default=False,
@@ -798,7 +798,7 @@ def process_args(args):
                         action='store',
                         type=str,
                         metavar='WARN:CRIT:UNITS',
-                        help='Check memory usage taking into account any limits. Valid values for units are %,B,KB,MB,GB.')
+                        help='Check memory usage taking into account any limits. Valid values for units are %%,B,KB,MB,GB.')
 
     # State
     parser.add_argument('--status',
@@ -868,10 +868,9 @@ def process_args(args):
 
     parser.add_argument('-V', action='version', version='%(prog)s {}'.format(__version__))
 
+    parsed_args = parser.parse_args(args=args)
     if len(args) == 0:
         parser.print_help()
-
-    parsed_args = parser.parse_args(args=args)
 
     global timeout
     timeout = parsed_args.timeout
@@ -889,11 +888,7 @@ def process_args(args):
             daemon = 'http://' + parsed_args.connection
             connection_type = 'http'
 
-    # Splitting the comma-separated strings into lists
-    containers = parsed_args.containers.split(',') if parsed_args.containers else ['all']
-    exclude_containers = parsed_args.exclude_containers.split(',') if parsed_args.exclude_containers else []
-
-    return parsed_args, containers, exclude_containers
+    return parsed_args
 
 
 def no_checks_present(parsed_args):
@@ -933,7 +928,7 @@ def print_results():
 
 
 def perform_checks(raw_args):
-    parsed_args, containers, exclude_containers = process_args(raw_args)
+    parsed_args = process_args(raw_args)
 
     global parallel_executor
     parallel_executor = futures.ThreadPoolExecutor(max_workers=parsed_args.threads)
@@ -964,7 +959,7 @@ def perform_checks(raw_args):
     # This is where all the work happens
     #############################################################################################
     try:
-        matching_containers = get_containers(containers, parsed_args.present, exclude_containers)
+        matching_containers = get_containers(parsed_args.containers, parsed_args.present, parsed_args.exclude_containers)
     except URLError as e:
         critical(f'Failed to connect to daemon: {e.reason}.')
         print_results()
